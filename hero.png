@@ -1,0 +1,473 @@
+import { useState, useEffect, useCallback } from "react";
+
+const CONFIG = {
+  SHEET_ID: "1cVRxHJs8KuU2N1XauApEIG-cuPKrGSld8qu40lHnf-Q",
+  API_KEY:  "AIzaSyDQckHIYoNncw3NWnsKh7EoUhrfOzk7o2g",
+  APPS_SCRIPT_URL: "https://script.google.com/macros/s/AKfycbzO50SkjBssSxQ8-TSRKvnJh2rN6GlHLtvv5Z0N0wNG1-DgaQoq7MvMRyfhm3c82Qykwg/exec",
+};
+
+const PLAYERS = [
+  "Player 1","Player 2","Player 3","Player 4",
+  "Player 5","Player 6","Player 7","Player 8",
+  "Player 9","Player 10","Player 11","Player 12",
+];
+
+const CATEGORIES = [
+  { id:"strength", label:"Strength & Conditioning", icon:"💪", color:"#FF6B35",
+    activities:["Weightlifting","Sprints / Cardio","Agility Ladder","Plyometrics","Core Work","Full Team Workout","Other"] },
+  { id:"ballhandling", label:"Ball Handling", icon:"🏀", color:"#F7C59F",
+    activities:["Dribble Series","Cone Drills","Ball Control","Between the Legs","Behind the Back","Speed Dribble","Other"] },
+  { id:"shooting", label:"Shooting", icon:"🎯", color:"#EFEFD0",
+    activities:["Spot Shooting","Off the Dribble","Free Throws","Pull-Up Jumper","3-Point Work","Post Moves","Other"] },
+  { id:"iq", label:"Basketball IQ", icon:"📚", color:"#A8DADC",
+    activities:["Watched NCAA WBB Game","Watched WNBA Game","Film Study / Breakdown",
+                "Read Basketball Article/Book","Listened to Basketball Podcast",
+                "Studied Plays/Playbook","Watched Highlight Film","Other"] },
+];
+
+const DAY_NAMES = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+const COACH_PIN = "1234";
+
+function fmt(d: Date){ return d.toISOString().split("T")[0]; }
+function weekStart(d: Date = new Date()){
+  const x=new Date(d),day=x.getDay(),diff=x.getDate()-day+(day===0?-6:1);
+  x.setDate(diff);x.setHours(0,0,0,0);return x;
+}
+function weekDates(){
+  const s=weekStart();
+  return Array.from({length:7},(_,i)=>{const d=new Date(s);d.setDate(d.getDate()+i);return d;});
+}
+
+async function fetchLogs(){
+  const url=`https://sheets.googleapis.com/v4/spreadsheets/${CONFIG.SHEET_ID}/values/Logs!A2:H?key=${CONFIG.API_KEY}`;
+  const res=await fetch(url);
+  if(!res.ok) throw new Error("Failed to fetch");
+  const data=await res.json();
+  return (data.values||[]).map((r: string[])=>({
+    id:r[0]||"",player:r[1]||"",category:r[2]||"",
+    activity:r[3]||"",duration:Number(r[4])||0,
+    notes:r[5]||"",date:r[6]||"",timestamp:r[7]||""
+  }));
+}
+
+async function appendLog(entry: any){
+  const row=[entry.id,entry.player,entry.category,entry.activity,
+             entry.duration,entry.notes,entry.date,entry.timestamp];
+  await fetch(CONFIG.APPS_SCRIPT_URL,{
+    method:"POST",
+    mode:"no-cors",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({action:"append",row})
+  });
+}
+
+function logsToMap(rows: any[]){
+  const map: any={};
+  rows.forEach(r=>{ if(!map[r.player])map[r.player]=[]; map[r.player].push(r); });
+  return map;
+}
+
+export default function App(){
+  const [view,setView]=useState("home");
+  const [player,setPlayer]=useState<string|null>(null);
+  const [logMap,setLogMap]=useState<any>({});
+  const [loading,setLoading]=useState(false);
+  const [syncStatus,setSyncStatus]=useState("idle");
+  const [form,setForm]=useState({cat:null as string|null,act:"",dur:30,notes:"",date:fmt(new Date())});
+  const [toast,setToast]=useState<{msg:string,type:string}|null>(null);
+  const [pin,setPin]=useState("");
+  const [pinErr,setPinErr]=useState(false);
+
+  const fire=(msg:string,type="ok")=>{setToast({msg,type});setTimeout(()=>setToast(null),3200);};
+
+  const loadLogs=useCallback(async()=>{
+    setLoading(true);
+    try{
+      const rows=await fetchLogs();
+      setLogMap(logsToMap(rows));
+    }catch(e){
+      fire("Couldn't load logs — check connection","err");
+    }finally{setLoading(false);}
+  },[]);
+
+  useEffect(()=>{loadLogs();},[loadLogs]);
+
+  const submit=async()=>{
+    if(!form.cat||!form.act){fire("Pick a category and activity!","err");return;}
+    const entry={
+      id:Date.now().toString(),player,category:form.cat,
+      activity:form.act,duration:form.dur,notes:form.notes,
+      date:form.date,timestamp:new Date().toISOString()
+    };
+    setLogMap((prev:any)=>({...prev,[player!]:[...(prev[player!]||[]),entry]}));
+    setForm({cat:null,act:"",dur:30,notes:"",date:fmt(new Date())});
+    setSyncStatus("saving");
+    try{
+      await appendLog(entry);
+      setSyncStatus("saved");
+      fire("Logged! Check your sheet in ~10 seconds 🔥");
+      setTimeout(()=>setSyncStatus("idle"),2500);
+    }catch(e){
+      setSyncStatus("error");
+      fire("Couldn't sync to sheet","err");
+    }
+  };
+
+  const stats=(p:string,lm:any=logMap)=>{
+    const pl=lm[p]||[],ws=weekStart();
+    const wl=pl.filter((x:any)=>new Date(x.date)>=ws);
+    const byCat:any={};CATEGORIES.forEach(c=>{byCat[c.id]=wl.filter((x:any)=>x.category===c.id).length;});
+    return{total:pl.length,week:wl.length,byCat,mins:wl.reduce((s:number,x:any)=>s+(x.duration||0),0)};
+  };
+
+  const wd=weekDates(),today=fmt(new Date());
+
+  const S:any={
+    app:{minHeight:"100vh",background:"#080814",color:"#fff",fontFamily:"'Arial Narrow',Arial,sans-serif"},
+    page:{maxWidth:500,margin:"0 auto",padding:"16px 14px 80px"},
+    center:{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",padding:"32px 20px"},
+    h2:{fontSize:26,fontWeight:900,letterSpacing:3,margin:"12px 0 4px"},
+    sub:{color:"#555",fontSize:12,marginBottom:18,letterSpacing:1},
+    inp:{background:"#11112a",border:"1px solid #222244",color:"#fff",borderRadius:9,padding:"10px 13px",fontSize:14,width:"100%",boxSizing:"border-box" as const,fontFamily:"inherit"},
+    card:{background:"#11112a",border:"1px solid #222244",borderRadius:14,padding:16,marginBottom:13},
+    bigbtn:{width:"100%",background:"#FF6B35",border:"none",color:"#fff",borderRadius:11,padding:14,fontSize:15,fontWeight:900,letterSpacing:3,cursor:"pointer",marginTop:18,boxShadow:"0 4px 18px rgba(255,107,53,0.35)"},
+    av:{width:38,height:38,borderRadius:"50%",background:"#FF6B35",color:"#fff",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,fontWeight:900,flexShrink:0},
+    av2:{width:50,height:50,borderRadius:"50%",background:"#FF6B35",color:"#fff",display:"flex",alignItems:"center",justifyContent:"center",fontSize:17,fontWeight:900,flexShrink:0},
+  };
+
+  const Bk=({to}:{to:string})=>(
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+      <button onClick={()=>{setView(to);setPinErr(false);}} style={{background:"none",border:"none",color:"#FF6B35",fontSize:13,cursor:"pointer",padding:"8px 0",letterSpacing:1}}>← Back</button>
+      <button onClick={loadLogs} style={{background:"none",border:"1px solid #222244",color:"#666",fontSize:11,cursor:"pointer",padding:"5px 12px",borderRadius:20}}>
+        {loading?"⟳ Syncing…":"↻ Refresh"}
+      </button>
+    </div>
+  );
+  const Lbl=({children}:{children:any})=><div style={{color:"#666",fontSize:10,letterSpacing:2,textTransform:"uppercase" as const,marginBottom:8,marginTop:16}}>{children}</div>;
+  const SyncBadge=()=>{
+    const map:any={saving:["#F7C59F","Saving…"],saved:["#A8DADC","Saved ✓"],error:["#FF6B35","Sync error"]};
+    if(syncStatus==="idle"||!map[syncStatus])return null;
+    const[color,label]=map[syncStatus];
+    return <span style={{fontSize:11,color,marginLeft:8}}>{label}</span>;
+  };
+  const LogCard=({log}:{log:any})=>{
+    const cat=CATEGORIES.find(c=>c.id===log.category);
+    return(
+      <div style={{display:"flex",gap:9,background:"#080814",borderRadius:9,padding:10,marginBottom:7}}>
+        <span style={{width:8,height:8,borderRadius:"50%",background:cat?.color,flexShrink:0,marginTop:5,display:"inline-block"}}/>
+        <div style={{flex:1}}>
+          <div style={{display:"flex",justifyContent:"space-between",fontSize:13,fontWeight:700}}>
+            <span>{log.activity}</span>
+            <span style={{color:"#444",fontSize:11,fontWeight:400}}>{log.date}</span>
+          </div>
+          <div style={{fontSize:11,color:"#444",marginTop:2}}>{cat?.label} · {log.duration} min{log.notes?` · "${log.notes}"`:" "}</div>
+        </div>
+      </div>
+    );
+  };
+  const Toast=()=>toast?<div style={{position:"fixed",bottom:24,left:"50%",transform:"translateX(-50%)",background:toast.type==="err"?"#c0392b":"#1a6b2a",color:"#fff",padding:"11px 22px",borderRadius:28,fontSize:13,fontWeight:700,zIndex:999,whiteSpace:"nowrap" as const,boxShadow:"0 4px 20px rgba(0,0,0,0.5)"}}>{toast.msg}</div>:null;
+
+  if(view==="home") return(
+    <div style={S.app}>
+      <div style={S.center}>
+        <div style={{textAlign:"center" as const,marginBottom:32}}>
+          <div style={{fontSize:56,marginBottom:4,filter:"drop-shadow(0 0 24px rgba(255,107,53,0.5))"}}>🏀</div>
+          <h1 style={{fontFamily:"'Arial Black',sans-serif",fontSize:44,margin:"0 0 4px",letterSpacing:5,textShadow:"0 0 40px rgba(255,107,53,0.3)"}}>
+            GRIND<span style={{color:"#FF6B35"}}>TRACK</span>
+          </h1>
+          <p style={{color:"#444",letterSpacing:4,textTransform:"uppercase" as const,fontSize:10,margin:"6px 0 14px"}}>Offseason Accountability</p>
+          <span style={{background:"#FF6B3512",border:"1px solid #FF6B3535",color:"#FF6B35",fontSize:10,padding:"4px 16px",borderRadius:20,letterSpacing:2}}>Girls Varsity Basketball</span>
+        </div>
+        <div style={{display:"flex",flexDirection:"column" as const,gap:11,width:"100%",maxWidth:360}}>
+          {[
+            {bg:"linear-gradient(135deg,#FF6B35,#ff8c5a)",icon:"🏃‍♀️",title:"Log My Workout",sub:"Track today's grind",fn:()=>setView("pick-log")},
+            {bg:"linear-gradient(135deg,#111128,#1a1a40)",icon:"📊",title:"My Progress",sub:"See your weekly stats",fn:()=>setView("pick-view"),border:"1px solid #222244"},
+            {bg:"linear-gradient(135deg,#0c2d54,#0f3d72)",icon:"📋",title:"Coach Dashboard",sub:"Team accountability view",fn:()=>setView("coach-gate")},
+          ].map((c,i)=>(
+            <button key={i} onClick={c.fn} style={{background:c.bg,border:c.border||"none",borderRadius:14,padding:"16px 20px",cursor:"pointer",display:"flex",alignItems:"center",gap:14,textAlign:"left" as const,boxShadow:"0 6px 24px rgba(0,0,0,0.5)"}}>
+              <span style={{fontSize:26}}>{c.icon}</span>
+              <div>
+                <div style={{color:"#fff",fontSize:15,fontWeight:900,letterSpacing:1}}>{c.title}</div>
+                <div style={{color:"rgba(255,255,255,0.5)",fontSize:11,marginTop:2}}>{c.sub}</div>
+              </div>
+            </button>
+          ))}
+        </div>
+        <p style={{marginTop:32,color:"#1e1e30",fontSize:10,letterSpacing:4,textTransform:"uppercase" as const}}>Put in the work. The game remembers.</p>
+      </div>
+      <Toast/>
+    </div>
+  );
+
+  if(view==="pick-log"||view==="pick-view"){
+    const isLog=view==="pick-log";
+    return(
+      <div style={S.app}><div style={S.page}>
+        <Bk to="home"/>
+        <h2 style={S.h2}>{isLog?"Who's Logging?":"Your Progress"}</h2>
+        <p style={S.sub}>{isLog?"Select your name":"Select your name to view stats"}</p>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          {PLAYERS.map(p=>{
+            const st=stats(p);
+            return(
+              <button key={p} style={{...S.card,margin:0,padding:"13px 10px",cursor:"pointer",display:"flex",flexDirection:"column" as const,alignItems:"center",gap:6}}
+                onClick={()=>{setPlayer(p);setView(isLog?"log":"pdash");}}>
+                <div style={S.av}>{p.split(" ").map((n:string)=>n[0]).join("")}</div>
+                <div style={{color:"#ccc",fontSize:12,textAlign:"center" as const,lineHeight:1.3}}>{p}</div>
+                {!isLog&&<div style={{background:"#FF6B3515",color:"#FF6B35",fontSize:10,padding:"2px 9px",borderRadius:10}}>{st.week} this week</div>}
+              </button>
+            );
+          })}
+        </div>
+        <Toast/>
+      </div></div>
+    );
+  }
+
+  if(view==="log") return(
+    <div style={S.app}><div style={S.page}>
+      <Bk to="pick-log"/>
+      <div style={{display:"flex",alignItems:"center",gap:13,marginBottom:20,...S.card}}>
+        <div style={S.av2}>{player!.split(" ").map((n:string)=>n[0]).join("")}</div>
+        <div>
+          <div style={{fontSize:19,fontWeight:900}}>{player}<SyncBadge/></div>
+          <div style={{color:"#555",fontSize:12}}>Log your workout</div>
+        </div>
+      </div>
+      <Lbl>Date</Lbl>
+      <input type="date" value={form.date} max={today} onChange={e=>setForm(f=>({...f,date:e.target.value}))} style={S.inp}/>
+      <Lbl>Category</Lbl>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+        {CATEGORIES.map(c=>(
+          <button key={c.id} onClick={()=>setForm(f=>({...f,cat:c.id,act:""}))}
+            style={{background:form.cat===c.id?c.color:"#11112a",border:`2px solid ${form.cat===c.id?c.color:"#222244"}`,
+                    borderRadius:12,padding:"13px 10px",cursor:"pointer",display:"flex",flexDirection:"column" as const,
+                    alignItems:"center",gap:5,color:form.cat===c.id?"#111":"#aaa",transition:"all 0.12s"}}>
+            <span style={{fontSize:22}}>{c.icon}</span>
+            <span style={{fontSize:11,textAlign:"center" as const,lineHeight:1.3}}>{c.label}</span>
+          </button>
+        ))}
+      </div>
+      {form.cat&&<>
+        <Lbl>Activity</Lbl>
+        <div style={{display:"flex",flexWrap:"wrap" as const,gap:8}}>
+          {CATEGORIES.find(c=>c.id===form.cat)!.activities.map(a=>(
+            <button key={a} onClick={()=>setForm(f=>({...f,act:a}))}
+              style={{background:form.act===a?"#FF6B35":"#11112a",border:`1px solid ${form.act===a?"#FF6B35":"#222244"}`,
+                      color:form.act===a?"#fff":"#aaa",borderRadius:18,padding:"6px 13px",cursor:"pointer",fontSize:12}}>
+              {a}
+            </button>
+          ))}
+        </div>
+      </>}
+      <Lbl>Duration: <span style={{color:"#FF6B35",fontWeight:900}}>{form.dur} min</span></Lbl>
+      <input type="range" min={5} max={180} step={5} value={form.dur}
+        onChange={e=>setForm(f=>({...f,dur:+e.target.value}))} style={{width:"100%",accentColor:"#FF6B35"}}/>
+      <div style={{display:"flex",justifyContent:"space-between",color:"#333",fontSize:10,marginTop:2}}><span>5 min</span><span>3 hrs</span></div>
+      <Lbl>Notes (optional)</Lbl>
+      <textarea value={form.notes} rows={3} placeholder="What did you work on? Any wins?"
+        onChange={e=>setForm(f=>({...f,notes:e.target.value}))}
+        style={{...S.inp,resize:"vertical" as const}}/>
+      <button style={{...S.bigbtn,opacity:syncStatus==="saving"?0.7:1}} onClick={submit} disabled={syncStatus==="saving"}>
+        {syncStatus==="saving"?"SAVING…":"LOG WORKOUT 🔥"}
+      </button>
+      {(logMap[player!]||[]).length>0&&<>
+        <div style={{color:"#444",fontSize:11,letterSpacing:2,textTransform:"uppercase" as const,marginTop:28,marginBottom:10}}>Recent Logs</div>
+        {[...(logMap[player!]||[])].reverse().slice(0,5).map((l:any)=><LogCard key={l.id} log={l}/>)}
+      </>}
+      <Toast/>
+    </div></div>
+  );
+
+  if(view==="pdash"){
+    const st=stats(player!);
+    const all=logMap[player!]||[];
+    return(
+      <div style={S.app}><div style={S.page}>
+        <Bk to="pick-view"/>
+        <div style={{display:"flex",alignItems:"center",gap:13,marginBottom:20,...S.card,padding:14}}>
+          <div style={S.av2}>{player!.split(" ").map((n:string)=>n[0]).join("")}</div>
+          <div><div style={{fontSize:19,fontWeight:900}}>{player}</div><div style={{color:"#555",fontSize:12}}>Offseason progress</div></div>
+        </div>
+        <div style={S.card}>
+          <div style={{color:"#444",fontSize:10,letterSpacing:2,textTransform:"uppercase" as const,marginBottom:14}}>This Week</div>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:14}}>
+            {wd.map((d,i)=>{
+              const ds=fmt(d),n=(all.filter((l:any)=>l.date===ds)).length,isT=ds===today;
+              return(
+                <div key={i} style={{display:"flex",flexDirection:"column" as const,alignItems:"center",gap:3}}>
+                  <span style={{fontSize:9,color:"#444",letterSpacing:1}}>{DAY_NAMES[i]}</span>
+                  <div style={{width:32,height:32,borderRadius:"50%",background:n>0?"#FF6B35":"#1a1a30",
+                    border:`2px solid ${isT?"#FF6B35":"transparent"}`,display:"flex",alignItems:"center",
+                    justifyContent:"center",color:"#fff",fontSize:12,fontWeight:900}}>{n>0?n:""}</div>
+                  <span style={{fontSize:9,color:"#333"}}>{d.getDate()}</span>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{display:"flex",justifyContent:"space-around",borderTop:"1px solid #1e1e38",paddingTop:12}}>
+            {[["Workouts",st.week,"#FF6B35"],["Minutes",st.mins,"#A8DADC"],["All-Time",st.total,"#F7C59F"]].map(([l,v,c])=>(
+              <div key={String(l)} style={{textAlign:"center" as const}}>
+                <div style={{color:String(c),fontSize:24,fontWeight:900}}>{v}</div>
+                <div style={{color:"#444",fontSize:10,letterSpacing:1}}>{l}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div style={S.card}>
+          <div style={{color:"#444",fontSize:10,letterSpacing:2,textTransform:"uppercase" as const,marginBottom:14}}>Category Breakdown</div>
+          {CATEGORIES.map(c=>{
+            const n=st.byCat[c.id];
+            return(
+              <div key={c.id} style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+                <span style={{fontSize:16,width:22}}>{c.icon}</span>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:11,color:"#555",marginBottom:3}}>{c.label}</div>
+                  <div style={{height:5,background:"#080814",borderRadius:3}}>
+                    <div style={{height:"100%",width:`${Math.min((n/5)*100,100)}%`,background:c.color,borderRadius:3,transition:"width 0.3s"}}/>
+                  </div>
+                </div>
+                <span style={{color:c.color,fontWeight:900,fontSize:16,width:20,textAlign:"right" as const}}>{n}</span>
+              </div>
+            );
+          })}
+        </div>
+        <div style={S.card}>
+          <div style={{color:"#444",fontSize:10,letterSpacing:2,textTransform:"uppercase" as const,marginBottom:12}}>Full History ({all.length})</div>
+          {all.length===0&&<p style={{color:"#444",fontSize:13}}>No workouts yet. Get to work! 💪</p>}
+          {[...all].reverse().slice(0,20).map((l:any)=><LogCard key={l.id} log={l}/>)}
+        </div>
+        <Toast/>
+      </div></div>
+    );
+  }
+
+  if(view==="coach-gate") return(
+    <div style={S.app}>
+      <div style={S.center}>
+        <div style={{width:"100%",maxWidth:500,padding:"0 14px",boxSizing:"border-box" as const}}><Bk to="home"/></div>
+        <div style={{...S.card,maxWidth:320,width:"100%",padding:"36px 28px",display:"flex",flexDirection:"column" as const,alignItems:"center"}}>
+          <span style={{fontSize:44,marginBottom:8}}>📋</span>
+          <h2 style={{...S.h2,textAlign:"center" as const}}>COACH ACCESS</h2>
+          <p style={{color:"#555",fontSize:13,marginBottom:20,textAlign:"center" as const}}>Enter PIN to view team dashboard</p>
+          <input type="password" value={pin} maxLength={6}
+            onChange={e=>{setPin(e.target.value);setPinErr(false);}}
+            placeholder="PIN" onKeyDown={(e:any)=>{if(e.key==="Enter"){if(pin===COACH_PIN)setView("coach");else setPinErr(true);}}}
+            style={{...S.inp,textAlign:"center" as const,letterSpacing:8,fontSize:20,width:150,marginBottom:8}}/>
+          {pinErr&&<p style={{color:"#FF6B35",fontSize:12,margin:"0 0 8px"}}>Incorrect PIN.</p>}
+          <button style={S.bigbtn} onClick={()=>{if(pin===COACH_PIN)setView("coach");else setPinErr(true);}}>ENTER</button>
+          <p style={{color:"#2a2a3a",fontSize:11,marginTop:12}}>Default PIN: 1234</p>
+        </div>
+      </div>
+    </div>
+  );
+
+  if(view==="coach"){
+    const ws=weekStart();
+    const pstats=PLAYERS.map(p=>({player:p,...stats(p)})).sort((a,b)=>b.week-a.week);
+    const twl=Object.values(logMap).flat().filter((l:any)=>new Date(l.date)>=ws);
+    const active=pstats.filter(x=>x.week>0).length;
+    const inactive=pstats.filter(x=>x.week===0);
+    return(
+      <div style={S.app}><div style={S.page}>
+        <Bk to="home"/>
+        <h2 style={S.h2}>COACH DASHBOARD</h2>
+        <p style={S.sub}>Girls Varsity Basketball · Offseason Tracker</p>
+        <div style={{display:"flex",gap:10,marginBottom:14}}>
+          {[[twl.length,"This Week","total workouts","#FF6B35"],[`${active}/${PLAYERS.length}`,"Active","logged this week","#A8DADC"],[PLAYERS.length-active,"Inactive","need a nudge","#F7C59F"]].map(([v,l,sub,c],i)=>(
+            <div key={i} style={{flex:1,...S.card,margin:0,padding:"12px 8px",textAlign:"center" as const}}>
+              <div style={{color:String(c),fontSize:22,fontWeight:900}}>{v}</div>
+              <div style={{color:"#666",fontSize:9,letterSpacing:1,textTransform:"uppercase" as const}}>{l}</div>
+              <div style={{color:"#444",fontSize:9}}>{sub}</div>
+            </div>
+          ))}
+        </div>
+        <div style={S.card}>
+          <div style={{color:"#444",fontSize:10,letterSpacing:2,textTransform:"uppercase" as const,marginBottom:14}}>Team Categories This Week</div>
+          {CATEGORIES.map(c=>{
+            const n=twl.filter((l:any)=>l.category===c.id).length;
+            return(
+              <div key={c.id} style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+                <span style={{fontSize:16,width:22}}>{c.icon}</span>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:11,color:"#555",marginBottom:3}}>{c.label}</div>
+                  <div style={{height:5,background:"#080814",borderRadius:3}}>
+                    <div style={{height:"100%",width:`${Math.min((n/Math.max(twl.length,1))*100,100)}%`,background:c.color,borderRadius:3}}/>
+                  </div>
+                </div>
+                <span style={{color:c.color,fontWeight:900,fontSize:16,width:20,textAlign:"right" as const}}>{n}</span>
+              </div>
+            );
+          })}
+        </div>
+        <div style={S.card}>
+          <div style={{color:"#444",fontSize:10,letterSpacing:2,textTransform:"uppercase" as const,marginBottom:14}}>Weekly Leaderboard 🏆</div>
+          {pstats.map((x,i)=>(
+            <div key={x.player} style={{display:"flex",alignItems:"center",gap:10,padding:"9px 0",borderBottom:"1px solid #161628",opacity:x.week===0?0.3:1}}>
+              <span style={{width:28,textAlign:"center" as const,fontSize:15,color:i===0?"#FFD700":i===1?"#C0C0C0":i===2?"#CD7F32":"#333",fontWeight:900}}>
+                {i===0?"🥇":i===1?"🥈":i===2?"🥉":`#${i+1}`}
+              </span>
+              <div style={{flex:1}}>
+                <div style={{fontSize:14,fontWeight:900}}>{x.player}</div>
+                <div style={{display:"flex",gap:3,marginTop:3}}>
+                  {CATEGORIES.map(c=>(
+                    <span key={c.id} title={c.label} style={{width:20,height:20,borderRadius:"50%",background:x.byCat[c.id]>0?c.color:"#1a1a30",display:"flex",alignItems:"center",justifyContent:"center",fontSize:10}}>{c.icon}</span>
+                  ))}
+                </div>
+              </div>
+              <div style={{textAlign:"right" as const}}>
+                <div style={{color:x.week>0?"#FF6B35":"#2a2a3a",fontSize:20,fontWeight:900}}>{x.week}</div>
+                <div style={{color:"#333",fontSize:10}}>{x.mins} min</div>
+              </div>
+            </div>
+          ))}
+        </div>
+        {inactive.length>0&&(
+          <div style={{...S.card,borderColor:"#FF6B3530"}}>
+            <div style={{color:"#FF6B35",fontSize:10,letterSpacing:2,textTransform:"uppercase" as const,marginBottom:10}}>⚠️ No Logs This Week</div>
+            <div style={{display:"flex",flexWrap:"wrap" as const,gap:8}}>
+              {inactive.map(x=>(
+                <span key={x.player} style={{background:"#1a0f00",border:"1px solid #FF6B3535",color:"#FF6B35",fontSize:11,padding:"4px 12px",borderRadius:20}}>{x.player}</span>
+              ))}
+            </div>
+          </div>
+        )}
+        <div style={S.card}>
+          <div style={{color:"#444",fontSize:10,letterSpacing:2,textTransform:"uppercase" as const,marginBottom:12}}>Weekly Activity Grid</div>
+          <div style={{overflowX:"auto" as const}}>
+            <table style={{width:"100%",borderCollapse:"collapse" as const,minWidth:460}}>
+              <thead>
+                <tr>
+                  <th style={{color:"#444",fontSize:10,padding:"0 4px 8px",textAlign:"left" as const,fontWeight:400}}>Player</th>
+                  {wd.map((d,i)=><th key={i} style={{color:"#444",fontSize:10,padding:"0 2px 8px",textAlign:"center" as const,fontWeight:400}}>{DAY_NAMES[i]}<br/><span style={{fontSize:9,color:"#333"}}>{d.getDate()}</span></th>)}
+                  <th style={{color:"#444",fontSize:10,padding:"0 0 8px 4px",textAlign:"center" as const,fontWeight:400}}>∑</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pstats.map(x=>(
+                  <tr key={x.player}>
+                    <td style={{fontSize:11,color:"#777",paddingRight:6,whiteSpace:"nowrap" as const,paddingBottom:3}}>{x.player.split(" ")[0]}</td>
+                    {wd.map((d,i)=>{
+                      const ds=fmt(d),n=(logMap[x.player]||[]).filter((l:any)=>l.date===ds).length;
+                      return(
+                        <td key={i} style={{padding:"2px",textAlign:"center" as const}}>
+                          <div style={{width:24,height:24,borderRadius:4,margin:"0 auto",display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,color:"#fff",
+                            background:n>0?`rgba(255,107,53,${Math.min(0.25+n*0.25,1)})`:"#111128"}}>
+                            {n>0?n:""}
+                          </div>
+                        </td>
+                      );
+                    })}
+                    <td style={{color:x.week>0?"#FF6B35":"#222",fontWeight:900,textAlign:"center" as const,fontSize:14}}>{x.week}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <Toast/>
+      </div></div>
+    );
+  }
+  return null;
+}
